@@ -1,0 +1,7 @@
+/.vs/
+/data/
+/target/
+
+*.sln
+*.vcxproj
+*.user
