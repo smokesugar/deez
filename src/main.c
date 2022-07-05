@@ -1,8 +1,12 @@
 #include <Windows.h>
 #include <memory.h>
+#include <stdio.h>
 
 #include "common.h"
 #include "renderer.h"
+
+static int64_t counter_start;
+static int64_t counter_freq;
 
 typedef struct {
     bool closed;
@@ -34,10 +38,24 @@ static LRESULT CALLBACK window_proc(HWND window, UINT msg, WPARAM w_param, LPARA
     return  result;
 }
 
+float engine_time() {
+    LARGE_INTEGER li;
+    QueryPerformanceCounter(&li);
+    int64_t time_i = li.QuadPart - counter_start;
+    double time = (double)time_i / (double)counter_freq;
+    return (float)time;
+}
+
 int CALLBACK WinMain(HINSTANCE h_instance, HINSTANCE h_prev_instance, LPSTR cmd_line, int cmd_show) {
     UNUSED(h_prev_instance);
     UNUSED(cmd_line);
     UNUSED(cmd_show);
+
+    LARGE_INTEGER li;
+    QueryPerformanceCounter(&li);
+    counter_start = li.QuadPart;
+    QueryPerformanceFrequency(&li);
+    counter_freq = li.QuadPart;
 
     WNDCLASSA wnd_class = { 0 };
     wnd_class.hInstance = h_instance;
@@ -52,7 +70,7 @@ int CALLBACK WinMain(HINSTANCE h_instance, HINSTANCE h_prev_instance, LPSTR cmd_
     Events events;
     SetWindowLongPtrA(window, GWLP_USERDATA, (LONG_PTR)&events);
 
-    Renderer* r = rd_init();
+    Renderer* r = rd_init(window);
 
     while (true) {
         memset(&events, 0, sizeof(events));

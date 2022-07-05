@@ -10,6 +10,7 @@ project "deez"
 
     targetdir "target/bin/%{prj.name}/%{cfg.buildcfg}"
     objdir "target/obj/%{prj.name}/%{cfg.buildcfg}"
+    debugdir "data"
 
     warnings "Extra"
     flags { "FatalWarnings" }
@@ -28,7 +29,8 @@ project "deez"
 
     links {
         "dxgi.lib",
-        "d3d12.lib"
+        "d3d12.lib",
+        "d3dcompiler.lib"
     }
 
     filter "configurations:Debug"
