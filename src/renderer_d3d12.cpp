@@ -1,6 +1,10 @@
 #include <dxgi1_4.h>
 #include <d3d12.h>
 #include <d3dcompiler.h>
+
+#include <DirectXMath.h>
+using namespace DirectX;
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
@@ -40,11 +44,20 @@ extern "C" {
         ID3D12DescriptorHeap* rtv_heap;
         D3D12_CPU_DESCRIPTOR_HANDLE rtvs[DXGI_MAX_SWAP_CHAIN_BUFFERS];
 
+        ID3D12DescriptorHeap* binding_heap;
+        D3D12_CPU_DESCRIPTOR_HANDLE camera_cbvs_cpu[DXGI_MAX_SWAP_CHAIN_BUFFERS];
+        D3D12_GPU_DESCRIPTOR_HANDLE camera_cbvs_gpu[DXGI_MAX_SWAP_CHAIN_BUFFERS];
+        void* camera_buffer_ptrs[DXGI_MAX_SWAP_CHAIN_BUFFERS];
+
+        ID3D12Resource* camera_buffer;
+
         ID3D12RootSignature* root_signature;
         ID3D12PipelineState* pipeline_state;
     };
 
     #define HR_CALL(call) if (FAILED(call)) message_box("D3D12 error")
+
+    #define ROUND_256(x) ((x + 255) & ~255)
 
     static void hwnd_size(HWND hwnd, uint32_t* w, uint32_t* h) {
         assert(w != h);
@@ -209,11 +222,68 @@ extern "C" {
         }
 
         create_rtvs(r);
+
+        D3D12_RESOURCE_DESC camera_buffer_desc = {};
+        camera_buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        camera_buffer_desc.Width = ROUND_256(sizeof(XMMATRIX)) * DXGI_MAX_SWAP_CHAIN_BUFFERS;
+        camera_buffer_desc.Height = 1;
+        camera_buffer_desc.DepthOrArraySize = 1;
+        camera_buffer_desc.MipLevels = 1;
+        camera_buffer_desc.SampleDesc.Count = 1;
+        camera_buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        D3D12_HEAP_PROPERTIES camera_buffer_heap_props = {};
+        camera_buffer_heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+        r->device->CreateCommittedResource(&camera_buffer_heap_props, D3D12_HEAP_FLAG_NONE, &camera_buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, IID_PPV_ARGS(&r->camera_buffer));
+
+        D3D12_DESCRIPTOR_HEAP_DESC binding_heap_desc = {};
+        binding_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        binding_heap_desc.NumDescriptors = DXGI_MAX_SWAP_CHAIN_BUFFERS;
+        binding_heap_desc.Flags |= D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+        r->device->CreateDescriptorHeap(&binding_heap_desc, IID_PPV_ARGS(&r->binding_heap));
+
+        void* camera_buffer_ptr;
+        r->camera_buffer->Map(0, NULL, &camera_buffer_ptr);
+
+        for (uint32_t i = 0; i < binding_heap_desc.NumDescriptors; ++i) {
+            uint64_t view_stride = r->device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            D3D12_CPU_DESCRIPTOR_HANDLE cpu_start = r->binding_heap->GetCPUDescriptorHandleForHeapStart();
+            D3D12_GPU_DESCRIPTOR_HANDLE gpu_start = r->binding_heap->GetGPUDescriptorHandleForHeapStart();
+            r->camera_cbvs_cpu[i] = { cpu_start.ptr + i * view_stride };
+            r->camera_cbvs_gpu[i] = { gpu_start.ptr + i * view_stride };
+
+            uint64_t buffer_stride = ROUND_256(sizeof(XMMATRIX));
+            r->camera_buffer_ptrs[i] = (uint8_t*)camera_buffer_ptr + i * buffer_stride;
+
+            D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc = {};
+            cbv_desc.BufferLocation = r->camera_buffer->GetGPUVirtualAddress() + i * buffer_stride;
+            cbv_desc.SizeInBytes = (uint32_t)buffer_stride;
+
+            r->device->CreateConstantBufferView(&cbv_desc, r->camera_cbvs_cpu[i]);
+        }
         
-        ID3DBlob* vs = compile_shader(L"test.hlsl", "vs_main", "vs_5_0");
-        ID3DBlob* ps = compile_shader(L"test.hlsl", "ps_main", "ps_5_0");
+        ID3DBlob* vs = compile_shader(L"test.hlsl", "vs_main", "vs_5_1");
+        ID3DBlob* ps = compile_shader(L"test.hlsl", "ps_main", "ps_5_1");
+
+        D3D12_DESCRIPTOR_RANGE descriptor_ranges[1] = {};
+        descriptor_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+        descriptor_ranges[0].NumDescriptors = 1;
+        descriptor_ranges[0].BaseShaderRegister = 0;
+        descriptor_ranges[0].RegisterSpace = 0;
+        descriptor_ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+        D3D12_ROOT_PARAMETER root_params[1] = {};
+        root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        root_params[0].DescriptorTable.NumDescriptorRanges = ARR_LEN(descriptor_ranges);
+        root_params[0].DescriptorTable.pDescriptorRanges = descriptor_ranges;
+        root_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
         D3D12_ROOT_SIGNATURE_DESC root_signature_desc = {};
+        root_signature_desc.NumParameters = ARR_LEN(root_params);
+        root_signature_desc.pParameters = root_params;
+
         r->root_signature = create_root_signature(r, &root_signature_desc);
 
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = {};
@@ -320,6 +390,9 @@ extern "C" {
         r->pipeline_state->Release();
         r->root_signature->Release();
 
+        r->camera_buffer->Release();
+
+        r->binding_heap->Release();
         r->rtv_heap->Release();
 
         release_swapchain_buffers(r);
@@ -382,6 +455,8 @@ extern "C" {
         cmdl->allocator->Reset();
         cmdl->list->Reset(cmdl->allocator, NULL);
 
+        cmdl->list->SetDescriptorHeaps(1, &r->binding_heap);
+
         D3D12_RESOURCE_BARRIER barrier = {};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barrier.Transition.pResource = r->swapchain_buffers[swapchain_index];
@@ -391,8 +466,7 @@ extern "C" {
 
         cmdl->list->ResourceBarrier(1, &barrier);
 
-        float time = engine_time();
-        float clear_color[] = { cosf(time * 5.0f) * 0.5f + 0.5f, sinf(time * 5.0f) * 0.5f + 0.5f, 0.8f, 1.0f };
+        float clear_color[] = { 0.01f, 0.01f, 0.01f, 1.0f };
         cmdl->list->ClearRenderTargetView(r->rtvs[swapchain_index], clear_color, 0, NULL);
         cmdl->list->OMSetRenderTargets(1, r->rtvs + swapchain_index, false, NULL);
 
@@ -410,6 +484,11 @@ extern "C" {
         cmdl->list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         cmdl->list->SetGraphicsRootSignature(r->root_signature);
         cmdl->list->SetPipelineState(r->pipeline_state);
+
+        XMMATRIX camera_transform = XMMatrixTranslation(sinf(engine_time() * PI_32), 0.0f, 5.0f);
+        XMMATRIX camera_matrix = XMMatrixInverse(NULL, camera_transform) * XMMatrixPerspectiveFovRH(3.14159f * 0.25f, (float)window_width / (float)window_height, 0.1f, 1000.0f);
+        memcpy(r->camera_buffer_ptrs[swapchain_index], &camera_matrix, sizeof(camera_matrix));
+        cmdl->list->SetGraphicsRootDescriptorTable(0, r->camera_cbvs_gpu[swapchain_index]);
 
         cmdl->list->DrawInstanced(3, 1, 0, 0);
 
