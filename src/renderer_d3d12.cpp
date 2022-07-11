@@ -45,14 +45,27 @@ extern "C" {
         D3D12_CPU_DESCRIPTOR_HANDLE rtvs[DXGI_MAX_SWAP_CHAIN_BUFFERS];
 
         ID3D12DescriptorHeap* binding_heap;
-        D3D12_CPU_DESCRIPTOR_HANDLE camera_cbvs_cpu[DXGI_MAX_SWAP_CHAIN_BUFFERS];
-        D3D12_GPU_DESCRIPTOR_HANDLE camera_cbvs_gpu[DXGI_MAX_SWAP_CHAIN_BUFFERS];
-        void* camera_buffer_ptrs[DXGI_MAX_SWAP_CHAIN_BUFFERS];
+        size_t binding_view_stride;
+        int binding_heap_cap;
+        int binding_heap_alloc_count;
 
         ID3D12Resource* camera_buffer;
+        int camera_cbvs[DXGI_MAX_SWAP_CHAIN_BUFFERS];
+        void* camera_buffer_ptrs[DXGI_MAX_SWAP_CHAIN_BUFFERS];
+
+        ID3D12Resource* vbuffer;
+        ID3D12Resource* ibuffer;
+        int vbuffer_srv;
+        int ibuffer_srv;
 
         ID3D12RootSignature* root_signature;
         ID3D12PipelineState* pipeline_state;
+    };
+
+    struct Vertex {
+        XMFLOAT3 pos;
+        XMFLOAT3 norm;
+        XMFLOAT2 uv;
     };
 
     #define HR_CALL(call) if (FAILED(call)) message_box("D3D12 error")
@@ -136,6 +149,40 @@ extern "C" {
         return rs;
     }
 
+    static ID3D12Resource* create_buffer(Renderer* r, size_t size) {
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = size;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        D3D12_HEAP_PROPERTIES heap_props = {};
+        heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+        ID3D12Resource* buffer = NULL;
+        r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, IID_PPV_ARGS(&buffer));
+
+        return buffer;
+    }
+
+    static int alloc_binding_view(Renderer* r) {
+        assert(r->binding_heap_alloc_count < r->binding_heap_cap);
+        return r->binding_heap_alloc_count++;
+    }
+
+    static D3D12_CPU_DESCRIPTOR_HANDLE binding_view_handle_cpu(Renderer* r, int idx) {
+        assert(idx < r->binding_heap_alloc_count);
+        return  { r->binding_heap->GetCPUDescriptorHandleForHeapStart().ptr + idx * r->binding_view_stride };
+    }
+
+    static D3D12_GPU_DESCRIPTOR_HANDLE binding_view_handle_gpu(Renderer* r, int idx) {
+        assert(idx < r->binding_heap_alloc_count);
+        return  { r->binding_heap->GetGPUDescriptorHandleForHeapStart().ptr + idx * r->binding_view_stride };
+    }
+
     Renderer* rd_init(void* window) {
         Renderer* r = (Renderer*)calloc(1, sizeof(Renderer));
 
@@ -190,7 +237,7 @@ extern "C" {
         r->device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&r->queue));
 
         r->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&r->fence));
-        
+
         HWND hwnd = (HWND)window;
 
         DXGI_SWAP_CHAIN_DESC1 swapchain_desc = {};
@@ -201,7 +248,7 @@ extern "C" {
         swapchain_desc.BufferCount = 2;
         swapchain_desc.Scaling = DXGI_SCALING_NONE;
         swapchain_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        
+
         IDXGISwapChain1* swapchain_1 = NULL;
         r->factory->CreateSwapChainForHwnd(r->queue, hwnd, &swapchain_desc, NULL, NULL, &swapchain_1);
         swapchain_1->QueryInterface(&r->swapchain);
@@ -215,44 +262,32 @@ extern "C" {
 
         r->device->CreateDescriptorHeap(&rtv_heap_desc, IID_PPV_ARGS(&r->rtv_heap));
 
-        for (uint32_t i = 0; i < rtv_heap_desc.NumDescriptors; ++i) {
-            uint64_t stride = r->device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-            D3D12_CPU_DESCRIPTOR_HANDLE heap_start = r->rtv_heap->GetCPUDescriptorHandleForHeapStart();
-            r->rtvs[i] = { heap_start.ptr + i * stride  };
-        }
-
-        create_rtvs(r);
-
-        D3D12_RESOURCE_DESC camera_buffer_desc = {};
-        camera_buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        camera_buffer_desc.Width = ROUND_256(sizeof(XMMATRIX)) * DXGI_MAX_SWAP_CHAIN_BUFFERS;
-        camera_buffer_desc.Height = 1;
-        camera_buffer_desc.DepthOrArraySize = 1;
-        camera_buffer_desc.MipLevels = 1;
-        camera_buffer_desc.SampleDesc.Count = 1;
-        camera_buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-        D3D12_HEAP_PROPERTIES camera_buffer_heap_props = {};
-        camera_buffer_heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
-
-        r->device->CreateCommittedResource(&camera_buffer_heap_props, D3D12_HEAP_FLAG_NONE, &camera_buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, IID_PPV_ARGS(&r->camera_buffer));
+        r->binding_heap_cap = 1024;
 
         D3D12_DESCRIPTOR_HEAP_DESC binding_heap_desc = {};
         binding_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        binding_heap_desc.NumDescriptors = DXGI_MAX_SWAP_CHAIN_BUFFERS;
+        binding_heap_desc.NumDescriptors = r->binding_heap_cap;
         binding_heap_desc.Flags |= D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 
         r->device->CreateDescriptorHeap(&binding_heap_desc, IID_PPV_ARGS(&r->binding_heap));
 
+        r->binding_view_stride = r->device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+        for (uint32_t i = 0; i < rtv_heap_desc.NumDescriptors; ++i) {
+            uint64_t stride = r->device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            D3D12_CPU_DESCRIPTOR_HANDLE heap_start = r->rtv_heap->GetCPUDescriptorHandleForHeapStart();
+            r->rtvs[i] = { heap_start.ptr + i * stride };
+        }
+
+        create_rtvs(r);
+
+        r->camera_buffer = create_buffer(r, ROUND_256(sizeof(XMMATRIX)) * DXGI_MAX_SWAP_CHAIN_BUFFERS);
+
         void* camera_buffer_ptr;
         r->camera_buffer->Map(0, NULL, &camera_buffer_ptr);
 
-        for (uint32_t i = 0; i < binding_heap_desc.NumDescriptors; ++i) {
-            uint64_t view_stride = r->device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            D3D12_CPU_DESCRIPTOR_HANDLE cpu_start = r->binding_heap->GetCPUDescriptorHandleForHeapStart();
-            D3D12_GPU_DESCRIPTOR_HANDLE gpu_start = r->binding_heap->GetGPUDescriptorHandleForHeapStart();
-            r->camera_cbvs_cpu[i] = { cpu_start.ptr + i * view_stride };
-            r->camera_cbvs_gpu[i] = { gpu_start.ptr + i * view_stride };
+        for (uint32_t i = 0; i < DXGI_MAX_SWAP_CHAIN_BUFFERS; ++i) {
+            r->camera_cbvs[i] = alloc_binding_view(r);
 
             uint64_t buffer_stride = ROUND_256(sizeof(XMMATRIX));
             r->camera_buffer_ptrs[i] = (uint8_t*)camera_buffer_ptr + i * buffer_stride;
@@ -261,24 +296,76 @@ extern "C" {
             cbv_desc.BufferLocation = r->camera_buffer->GetGPUVirtualAddress() + i * buffer_stride;
             cbv_desc.SizeInBytes = (uint32_t)buffer_stride;
 
-            r->device->CreateConstantBufferView(&cbv_desc, r->camera_cbvs_cpu[i]);
+            r->device->CreateConstantBufferView(&cbv_desc, binding_view_handle_cpu(r, r->camera_cbvs[i]));
         }
+
+        Vertex vbuffer_data[] = {
+            { { 0.0f,  0.5f, 0.0f }, { 1.0f, 0.0f, 0.0f }, { 0.0f, 0.0f} },
+            { {-0.5f, -0.5f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 0.0f, 0.0f} },
+            { { 0.5f, -0.5f, 0.0f }, { 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f} },
+        };
+
+        uint32_t ibuffer_data[] = {
+            0, 1, 2
+        };
+
+        r->vbuffer = create_buffer(r, sizeof(vbuffer_data));
+        r->ibuffer = create_buffer(r, sizeof(ibuffer_data));
+
+        void* vbuffer_ptr = NULL;
+        r->vbuffer->Map(0, NULL, &vbuffer_ptr);
+        memcpy(vbuffer_ptr, vbuffer_data, sizeof(vbuffer_data));
+        r->vbuffer->Unmap(0, NULL);
+
+        void* ibuffer_ptr = NULL;
+        r->ibuffer->Map(0, NULL, &ibuffer_ptr);
+        memcpy(ibuffer_ptr, ibuffer_data, sizeof(ibuffer_data));
+        r->ibuffer->Unmap(0, NULL);
+
+        r->vbuffer_srv = alloc_binding_view(r);
+        r->ibuffer_srv = alloc_binding_view(r);
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC vbuffer_srv_desc = {};
+        vbuffer_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        vbuffer_srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        vbuffer_srv_desc.Buffer.NumElements = ARR_LEN(vbuffer_data);
+        vbuffer_srv_desc.Buffer.StructureByteStride = sizeof(vbuffer_data[0]);
+
+        r->device->CreateShaderResourceView(r->vbuffer, &vbuffer_srv_desc, binding_view_handle_cpu(r, r->vbuffer_srv));
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC ibuffer_srv_desc = {};
+        ibuffer_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        ibuffer_srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        ibuffer_srv_desc.Buffer.NumElements = ARR_LEN(ibuffer_data);
+        ibuffer_srv_desc.Buffer.StructureByteStride = sizeof(uint32_t);
+
+        r->device->CreateShaderResourceView(r->ibuffer, &ibuffer_srv_desc, binding_view_handle_cpu(r, r->ibuffer_srv));
         
         ID3DBlob* vs = compile_shader(L"test.hlsl", "vs_main", "vs_5_1");
         ID3DBlob* ps = compile_shader(L"test.hlsl", "ps_main", "ps_5_1");
 
-        D3D12_DESCRIPTOR_RANGE descriptor_ranges[1] = {};
+        D3D12_DESCRIPTOR_RANGE descriptor_ranges[3] = {};
+
         descriptor_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
         descriptor_ranges[0].NumDescriptors = 1;
         descriptor_ranges[0].BaseShaderRegister = 0;
-        descriptor_ranges[0].RegisterSpace = 0;
-        descriptor_ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-        D3D12_ROOT_PARAMETER root_params[1] = {};
-        root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        root_params[0].DescriptorTable.NumDescriptorRanges = ARR_LEN(descriptor_ranges);
-        root_params[0].DescriptorTable.pDescriptorRanges = descriptor_ranges;
-        root_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        descriptor_ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        descriptor_ranges[1].NumDescriptors = 1;
+        descriptor_ranges[1].BaseShaderRegister = 0;
+
+        descriptor_ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        descriptor_ranges[2].NumDescriptors = 1;
+        descriptor_ranges[2].BaseShaderRegister = 1;
+
+        D3D12_ROOT_PARAMETER root_params[ARR_LEN(descriptor_ranges)] = {};
+
+        for (int i = 0; i < ARR_LEN(descriptor_ranges); ++i) {
+            root_params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            root_params[i].DescriptorTable.NumDescriptorRanges = 1;
+            root_params[i].DescriptorTable.pDescriptorRanges = descriptor_ranges + i;
+            root_params[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        }
 
         D3D12_ROOT_SIGNATURE_DESC root_signature_desc = {};
         root_signature_desc.NumParameters = ARR_LEN(root_params);
@@ -390,6 +477,9 @@ extern "C" {
         r->pipeline_state->Release();
         r->root_signature->Release();
 
+        r->ibuffer->Release();
+        r->vbuffer->Release();
+
         r->camera_buffer->Release();
 
         r->binding_heap->Release();
@@ -485,11 +575,13 @@ extern "C" {
         cmdl->list->SetGraphicsRootSignature(r->root_signature);
         cmdl->list->SetPipelineState(r->pipeline_state);
 
-        XMMATRIX camera_transform = XMMatrixTranslation(sinf(engine_time() * PI_32), 0.0f, 5.0f);
-        XMMATRIX camera_matrix = XMMatrixInverse(NULL, camera_transform) * XMMatrixPerspectiveFovRH(3.14159f * 0.25f, (float)window_width / (float)window_height, 0.1f, 1000.0f);
+        XMMATRIX camera_transform = XMMatrixTranslation(sinf(engine_time() * PI_32), 0.0f, 3.0f);
+        XMMATRIX camera_matrix = XMMatrixRotationRollPitchYaw(0.0f, 0.0f, sinf(cosf(engine_time()) * 2.0f) * 3.149f) * XMMatrixInverse(NULL, camera_transform) * XMMatrixPerspectiveFovRH(3.14159f * 0.25f, (float)window_width / (float)window_height, 0.1f, 1000.0f);
         memcpy(r->camera_buffer_ptrs[swapchain_index], &camera_matrix, sizeof(camera_matrix));
-        cmdl->list->SetGraphicsRootDescriptorTable(0, r->camera_cbvs_gpu[swapchain_index]);
+        cmdl->list->SetGraphicsRootDescriptorTable(0, binding_view_handle_gpu(r, r->camera_cbvs[swapchain_index]));
 
+        cmdl->list->SetGraphicsRootDescriptorTable(1, binding_view_handle_gpu(r, r->vbuffer_srv));
+        cmdl->list->SetGraphicsRootDescriptorTable(2, binding_view_handle_gpu(r, r->ibuffer_srv));
         cmdl->list->DrawInstanced(3, 1, 0, 0);
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
